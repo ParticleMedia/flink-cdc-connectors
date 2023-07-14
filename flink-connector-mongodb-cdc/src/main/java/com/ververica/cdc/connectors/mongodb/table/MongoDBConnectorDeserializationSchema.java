@@ -39,6 +39,7 @@ import com.ververica.cdc.connectors.mongodb.internal.MongoDBEnvelope;
 import com.ververica.cdc.debezium.DebeziumDeserializationSchema;
 import com.ververica.cdc.debezium.table.AppendMetadataCollector;
 import com.ververica.cdc.debezium.table.MetadataConverter;
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
@@ -56,6 +57,8 @@ import org.bson.codecs.BsonArrayCodec;
 import org.bson.codecs.EncoderContext;
 import org.bson.json.JsonWriter;
 import org.bson.types.Decimal128;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
 import java.io.StringWriter;
@@ -83,6 +86,8 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
 public class MongoDBConnectorDeserializationSchema
         implements DebeziumDeserializationSchema<RowData> {
 
+    private static final Logger LOG =
+            LoggerFactory.getLogger(MongoDBConnectorDeserializationSchema.class);
     private static final long serialVersionUID = 1750787080613035184L;
 
     /** TypeInformation of the produced {@link RowData}. */
@@ -132,9 +137,18 @@ public class MongoDBConnectorDeserializationSchema
 
         switch (op) {
             case INSERT:
-                GenericRowData insert = extractRowData(fullDocument);
-                insert.setRowKind(RowKind.INSERT);
-                emit(record, insert, out);
+                try {
+                    GenericRowData insert = extractRowData(fullDocument);
+                    insert.setRowKind(RowKind.INSERT);
+                    emit(record, insert, out);
+                } catch (Exception e) {
+                    LOG.error(
+                            "ERROR extract RowData is {}",
+                            fullDocument != null ? fullDocument.toJson() : "NULL");
+                    LOG.error(ExceptionUtils.getStackTrace(e));
+                    LOG.error("record is {}, out is {}", record, out);
+                    throw e;
+                }
                 break;
             case DELETE:
                 GenericRowData delete = extractRowData(documentKey);
@@ -168,7 +182,15 @@ public class MongoDBConnectorDeserializationSchema
 
     protected GenericRowData extractRowData(BsonDocument document) throws Exception {
         checkNotNull(document);
-        return (GenericRowData) physicalConverter.convert(document);
+        try {
+            return (GenericRowData) physicalConverter.convert(document);
+        } catch (IllegalArgumentException e) {
+            LOG.error(
+                    "ERROR physical converter document is {}, error message is {}",
+                    document.toJson(),
+                    e.getMessage());
+            return (GenericRowData) physicalConverter.convert(new BsonDocument());
+        }
     }
 
     protected BsonDocument extractBsonDocument(Struct value, Schema valueSchema, String fieldName) {
@@ -732,6 +754,11 @@ public class MongoDBConnectorDeserializationSchema
             }
 
             List<BsonValue> in = docObj.asArray();
+            boolean containNull = in.stream().anyMatch(BsonValue::isNull);
+            if (containNull) {
+                LOG.error("Array contains null value, doc obj: {}", docObj);
+                return new GenericArrayData(new Object[] {});
+            }
             final Object[] elementArray = (Object[]) Array.newInstance(elementClass, in.size());
             for (int i = 0; i < in.size(); i++) {
                 elementArray[i] = elementConverter.convert(in.get(i));
